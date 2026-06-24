@@ -173,47 +173,37 @@ impl DefaultDistributedPlanner {
             .as_any()
             .downcast_ref::<SortPreservingMergeExec>(
         ) {
-            // For TopK queries (SortPreservingMergeExec with a small fetch/limit),
-            // skip the stage break and keep the merge in the same stage as its children.
-            // This avoids the overhead of shuffle write/read for a small number of rows,
-            // which dominates execution time for TopK queries in distributed mode.
-            //
-            // Note on parallelism: because SortPreservingMergeExec has an output
-            // partitioning of 1, the entire stage becomes a single task assigned to
-            // one executor (ShuffleWriterExec::input_partition_count() == 1).
-            // This does sacrifice cluster-level parallelism (no cross-executor
-            // distribution). However, within that executor the child partitions
-            // still execute as parallel async streams, so intra-executor parallelism
-            // is preserved. For small fetch values this trade-off is worthwhile as
-            // the shuffle coordination overhead far exceeds the merge cost.
-            const TOPK_FETCH_THRESHOLD: usize = 1000;
-            if sort_preserving_merge
-                .fetch()
-                .is_some_and(|f| f <= TOPK_FETCH_THRESHOLD)
-            {
-                Ok((
-                    with_new_children_if_necessary(execution_plan, children)?,
-                    stages,
-                ))
-            } else {
+            if sort_preserving_merge.fetch().is_some() {
+                // A SortPreservingMergeExec with fetch is a global TopK boundary. Materialize
+                // that boundary as its own stage so parent operators (joins, repartitions, etc.)
+                // consume an already-limited shuffle instead of re-optimizing away the merge.
+                let topk_plan = with_new_children_if_necessary(execution_plan, children)?;
                 let shuffle_writer = create_shuffle_writer_with_config(
                     job_id,
                     self.next_stage_id(),
-                    children[0].clone(),
+                    topk_plan,
                     None,
                     config,
                 )?;
                 let unresolved_shuffle =
                     create_unresolved_shuffle(shuffle_writer.as_ref());
                 stages.push(shuffle_writer);
-                Ok((
-                    with_new_children_if_necessary(
-                        execution_plan,
-                        vec![unresolved_shuffle],
-                    )?,
-                    stages,
-                ))
+                return Ok((unresolved_shuffle, stages));
             }
+
+            let shuffle_writer = create_shuffle_writer_with_config(
+                job_id,
+                self.next_stage_id(),
+                children[0].clone(),
+                None,
+                config,
+            )?;
+            let unresolved_shuffle = create_unresolved_shuffle(shuffle_writer.as_ref());
+            stages.push(shuffle_writer);
+            Ok((
+                with_new_children_if_necessary(execution_plan, vec![unresolved_shuffle])?,
+                stages,
+            ))
         } else if let Some(repart) =
             execution_plan.as_any().downcast_ref::<RepartitionExec>()
         {
@@ -969,10 +959,11 @@ order by
     }
 
     /// Verifies that TopK queries (ORDER BY ... LIMIT N, where N is small)
-    /// do NOT create a stage break at SortPreservingMergeExec, avoiding
-    /// shuffle overhead for small result sets.
+    /// create a stage break at SortPreservingMergeExec. The global merge/limit
+    /// boundary must be materialized before parent operators such as joins can
+    /// consume the TopK result.
     #[tokio::test]
-    async fn test_topk_avoids_stage_break() -> Result<(), BallistaError> {
+    async fn test_topk_creates_stage_break() -> Result<(), BallistaError> {
         use datafusion::prelude::{CsvReadOptions, SessionConfig, SessionContext};
         use std::io::Write;
 
@@ -996,7 +987,8 @@ order by
         )
         .await?;
 
-        // TopK query with small LIMIT — should produce a single stage
+        // TopK query with small LIMIT must still preserve the global merge/limit
+        // boundary across distributed stages.
         let df = ctx
             .sql("SELECT id, value FROM test_table ORDER BY value DESC LIMIT 10")
             .await?;
@@ -1010,24 +1002,19 @@ order by
             ctx.state().config().options(),
         )?;
 
-        for (i, stage) in stages.iter().enumerate() {
-            println!(
-                "TopK Stage {i}:\n{}",
-                displayable(stage.as_ref()).indent(false)
-            );
-        }
-
-        // Should be a single stage (no shuffle for TopK with small limit)
         assert_eq!(
-            1,
+            2,
             stages.len(),
-            "TopK with small LIMIT should produce 1 stage, got {}",
+            "TopK with small LIMIT should produce 2 stages, got {}",
             stages.len()
         );
 
-        // The single stage should contain SortPreservingMergeExec
-        let root = stages[0].children()[0].clone();
-        let _merge = downcast_exec!(root, SortPreservingMergeExec);
+        let topk_stage = stages[0].children()[0].clone();
+        let merge = downcast_exec!(topk_stage, SortPreservingMergeExec);
+        assert_eq!(Some(10), merge.fetch());
+
+        let root_stage = stages[1].children()[0].clone();
+        let _shuffle = downcast_exec!(root_stage, UnresolvedShuffleExec);
 
         // Without LIMIT, the same query should produce 2 stages (with shuffle)
         let df_no_limit = ctx
@@ -1048,6 +1035,96 @@ order by
             stages_no_limit.len(),
             "ORDER BY without LIMIT should produce 2 stages, got {}",
             stages_no_limit.len()
+        );
+        let root = stages_no_limit[1].children()[0].clone();
+        let merge = downcast_exec!(root, SortPreservingMergeExec);
+        assert_eq!(None, merge.fetch());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_topk_subquery_join_materializes_limit_before_parent_join()
+    -> Result<(), BallistaError> {
+        use datafusion::prelude::{CsvReadOptions, SessionConfig, SessionContext};
+        use std::io::Write;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("zone_payments.csv");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "pickup_zone,payment_type,total_amount").unwrap();
+        for (zone, rows) in [(10, 5), (20, 4), (30, 3), (40, 2)] {
+            for idx in 0..rows {
+                writeln!(f, "{zone},{},10", if idx % 2 == 0 { 1 } else { 2 }).unwrap();
+            }
+        }
+
+        let config = SessionConfig::new().with_target_partitions(3);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_csv(
+            "zone_payments",
+            tmp_dir.path().to_str().unwrap(),
+            CsvReadOptions::new(),
+        )
+        .await?;
+
+        let df = ctx
+            .sql(
+                r#"WITH top_zones AS (
+                    SELECT CAST(pickup_zone AS BIGINT) AS pickup_zone
+                    FROM zone_payments
+                    GROUP BY CAST(pickup_zone AS BIGINT)
+                    ORDER BY COUNT(*) DESC, pickup_zone ASC
+                    LIMIT 2
+                )
+                SELECT
+                    CAST(zp.pickup_zone AS BIGINT) AS pickup_zone,
+                    CAST(zp.payment_type AS BIGINT) AS payment_type,
+                    COUNT(*) AS trips,
+                    SUM(CAST(zp.total_amount AS BIGINT)) AS revenue
+                FROM zone_payments zp
+                INNER JOIN top_zones z
+                    ON CAST(zp.pickup_zone AS BIGINT) = z.pickup_zone
+                GROUP BY CAST(zp.pickup_zone AS BIGINT), CAST(zp.payment_type AS BIGINT)
+                ORDER BY pickup_zone ASC, trips DESC, payment_type ASC"#,
+            )
+            .await?;
+        let plan = df.into_optimized_plan()?;
+        let plan = ctx.state().create_physical_plan(&plan).await?;
+
+        let mut planner = DefaultDistributedPlanner::new();
+        let stages = planner.plan_query_stages(
+            "job-topk-join",
+            plan,
+            ctx.state().config().options(),
+        )?;
+
+        let rendered_stages = stages
+            .iter()
+            .map(|stage| format!("{}", displayable(stage.as_ref()).indent(false)))
+            .collect::<Vec<_>>();
+        let topk_stage = rendered_stages
+            .iter()
+            .find(|stage| {
+                stage.contains("SortPreservingMergeExec:") && stage.contains("fetch=2")
+            })
+            .expect("TopK merge/fetch must be materialized in a shuffle writer stage");
+        assert!(
+            topk_stage.contains("ShuffleWriterExec:"),
+            "TopK merge/fetch must be materialized before parent operators:\n{topk_stage}"
+        );
+
+        let join_stage = rendered_stages
+            .iter()
+            .find(|stage| stage.contains("HashJoinExec:"))
+            .expect("distributed planner should emit a parent join stage");
+        assert!(
+            join_stage.contains("UnresolvedShuffleExec:"),
+            "parent join must consume a materialized shuffle for the TopK side:\n{join_stage}"
+        );
+        assert!(
+            !join_stage.contains("fetch=2"),
+            "TopK merge/fetch must not be left for the parent join stage:\n{join_stage}"
         );
 
         Ok(())
