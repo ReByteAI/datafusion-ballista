@@ -830,9 +830,10 @@ fn fetch_partition_local_vortex(
 
 /// Fetch partition data from in-memory shuffle storage.
 ///
-/// After successfully fetching the data, the partition is removed from memory
-/// to allow for immediate memory reclamation. This is safe because each shuffle
-/// partition is typically read only once by the consuming stage.
+/// In-memory shuffle partitions must have the same read semantics as disk and
+/// remote Flight shuffle partitions: reading is non-destructive. A stage output
+/// can be consumed by multiple downstream tasks, retried after a failed task, or
+/// fetched through either the local or remote path depending on scheduling.
 async fn fetch_partition_memory(
     location: &PartitionLocation,
 ) -> result::Result<SendableRecordBatchStream, BallistaError> {
@@ -847,25 +848,17 @@ async fn fetch_partition_memory(
 
     let shuffle_manager = global_shuffle_manager();
 
-    // Remove and retrieve the partition data in one atomic operation
-    // This ensures the memory is reclaimed as soon as the data is read
-    let data = shuffle_manager
-        .remove_partition(key)
-        .ok_or_else(|| {
-            // If remove fails, try a regular get (for retry scenarios)
-            shuffle_manager.get_partition(key).map_err(|e| {
-                BallistaError::FetchFailed(
-                    metadata.id.clone(),
-                    partition_id.stage_id,
-                    partition_id.partition_id,
-                    e.to_string(),
-                )
-            })
-        })
-        .or_else(|result| result)?;
+    let data = shuffle_manager.get_partition(key).map_err(|e| {
+        BallistaError::FetchFailed(
+            metadata.id.clone(),
+            partition_id.stage_id,
+            partition_id.partition_id,
+            e.to_string(),
+        )
+    })?;
 
     debug!(
-        "Fetched and removed partition {} from memory: {} batches, {} rows",
+        "Fetched partition {} from memory: {} batches, {} rows",
         key, data.num_batches, data.num_rows
     );
 

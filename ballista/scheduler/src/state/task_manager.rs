@@ -228,7 +228,6 @@ pub struct TaskManager<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
 ///
 /// Contains the execution graph and cached data to improve performance
 /// when scheduling tasks for the job.
-#[derive(Clone)]
 pub struct JobInfoCache {
     /// The execution graph for this job, protected by a read-write lock.
     pub execution_graph: Arc<RwLock<ExecutionGraphBox>>,
@@ -237,6 +236,19 @@ pub struct JobInfoCache {
     #[cfg(not(feature = "disable-stage-plan-cache"))]
     /// Cache for encoded execution stage plans to avoid redundant serialization.
     encoded_stage_plans: HashMap<usize, Vec<u8>>,
+}
+
+impl Clone for JobInfoCache {
+    fn clone(&self) -> Self {
+        Self {
+            execution_graph: Arc::clone(&self.execution_graph),
+            status: self.status.clone(),
+            // Scheduling snapshots only need status and the graph handle. Do not
+            // deep-copy encoded plan bytes on every revive/poll cycle.
+            #[cfg(not(feature = "disable-stage-plan-cache"))]
+            encoded_stage_plans: HashMap::new(),
+        }
+    }
 }
 
 impl JobInfoCache {
@@ -364,18 +376,28 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     /// long run of identical snapshots while executors are alive and the
     /// job is not terminal is what triggers the operator-facing warning.
     pub(crate) async fn capture_progress_snapshot(&self) -> Vec<JobProgressSnapshot> {
-        let mut out = Vec::with_capacity(self.active_job_cache.len());
-        for entry in self.active_job_cache.iter() {
-            let job_id = entry.key().clone();
-            let job_info = entry.value();
+        let active_jobs: Vec<_> = self
+            .active_job_cache
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().status.clone(),
+                    Arc::clone(&entry.value().execution_graph),
+                )
+            })
+            .collect();
+
+        let mut out = Vec::with_capacity(active_jobs.len());
+        for (job_id, status, execution_graph) in active_jobs {
             let is_terminal = matches!(
-                job_info.status,
+                status,
                 Some(job_status::Status::Successful(_))
                     | Some(job_status::Status::Failed(_))
             );
             let stages = match tokio::time::timeout(
                 Duration::from_millis(500),
-                job_info.execution_graph.read(),
+                execution_graph.read(),
             )
             .await
             {
@@ -408,16 +430,24 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     /// hot loop or after every event) as it can cause lock contention with
     /// concurrent task binding operations.
     pub async fn total_pending_tasks(&self) -> usize {
+        let active_jobs: Vec<_> = self
+            .active_job_cache
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    Arc::clone(&entry.value().execution_graph),
+                )
+            })
+            .collect();
+
         let mut total = 0;
-        for entry in self.active_job_cache.iter() {
+        for (job_id, execution_graph) in active_jobs {
             // Use a timeout to avoid blocking indefinitely if there's lock contention.
             // If we can't acquire the lock within the timeout, skip this job's count
             // rather than blocking the metrics collection.
-            match tokio::time::timeout(
-                Duration::from_millis(100),
-                entry.value().execution_graph.read(),
-            )
-            .await
+            match tokio::time::timeout(Duration::from_millis(100), execution_graph.read())
+                .await
             {
                 Ok(graph) => {
                     total += graph.available_tasks();
@@ -426,7 +456,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                     // Lock acquisition timed out, skip this job
                     trace!(
                         "Skipping pending task count for job {} due to lock contention",
-                        entry.key()
+                        job_id
                     );
                 }
             }
@@ -713,11 +743,15 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     pub async fn executor_lost(&self, executor_id: &str) -> Result<Vec<RunningTaskInfo>> {
         // Collect all the running task need to cancel when there are running stages rolled back.
         let mut running_tasks_to_cancel: Vec<RunningTaskInfo> = vec![];
+        let active_graphs: Vec<_> = self
+            .active_job_cache
+            .iter()
+            .map(|entry| Arc::clone(&entry.value().execution_graph))
+            .collect();
 
         {
-            for pairs in self.active_job_cache.iter() {
-                let (_job_id, job_info) = pairs.pair();
-                let mut graph = job_info.execution_graph.write().await;
+            for execution_graph in active_graphs {
+                let mut graph = execution_graph.write().await;
                 let reset = graph.reset_stages_on_lost_executor(executor_id)?;
                 if !reset.0.is_empty() {
                     running_tasks_to_cancel.extend(reset.1);

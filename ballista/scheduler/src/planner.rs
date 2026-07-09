@@ -441,7 +441,14 @@ fn create_shuffle_writer_with_config(
         .cloned()
         .unwrap_or_default();
 
-    if ballista_config.shuffle_sort_based_enabled() {
+    let shuffle_storage_type = ballista_config.shuffle_storage_type();
+    let sort_shuffle_storage_supported = shuffle_storage_type
+        .eq_ignore_ascii_case("local")
+        || shuffle_storage_type.eq_ignore_ascii_case("disk");
+    let sort_shuffle_supported =
+        sort_shuffle_storage_supported && !ballista_config.shuffle_memory_mode();
+
+    if ballista_config.shuffle_sort_based_enabled() && sort_shuffle_supported {
         // Sort shuffle requires hash partitioning
         if let Some(Partitioning::Hash(exprs, partition_count)) = partitioning {
             let sort_config = SortShuffleConfig::new(

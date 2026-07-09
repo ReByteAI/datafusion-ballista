@@ -388,6 +388,7 @@ impl ShuffleStorage for LocalShuffleStorage {
 pub struct ObjectStoreShuffleStorage {
     store: Arc<dyn ObjectStore>,
     base_url: String,
+    base_path: Option<String>,
     storage_type: ShuffleStorageType,
 }
 
@@ -429,10 +430,12 @@ impl ObjectStoreShuffleStorage {
             .base_url
             .clone()
             .unwrap_or_else(|| format!("s3://{}", bucket));
+        let base_path = object_store_base_path(&base_url);
 
         Ok(Self {
             store: Arc::new(store),
             base_url,
+            base_path,
             storage_type: ShuffleStorageType::S3,
         })
     }
@@ -484,10 +487,12 @@ impl ObjectStoreShuffleStorage {
         let base_url = config.base_url.clone().unwrap_or_else(|| {
             format!("abfs://{}@{}.dfs.core.windows.net", container, account)
         });
+        let base_path = object_store_base_path(&base_url);
 
         Ok(Self {
             store: Arc::new(store),
             base_url,
+            base_path,
             storage_type: ShuffleStorageType::Azure,
         })
     }
@@ -519,8 +524,9 @@ impl ObjectStoreShuffleStorage {
     ) -> (String, ObjectPath) {
         let relative_path =
             self.make_path(job_id, stage_id, partition_id, input_partition, file_ext);
-        let full_url = format!("{}/{}", self.base_url, relative_path);
-        let object_path = ObjectPath::from(relative_path);
+        let full_url =
+            format!("{}/{}", self.base_url.trim_end_matches('/'), relative_path);
+        let object_path = self.object_path(&relative_path);
         (full_url, object_path)
     }
 
@@ -582,9 +588,8 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
         schema: SchemaRef,
         write_metric: &metrics::Time,
     ) -> Result<(String, PartitionStats)> {
-        let relative_path =
-            self.make_path(job_id, stage_id, partition_id, input_partition, "arrow");
-        let full_url = format!("{}/{}", self.base_url, relative_path);
+        let (full_url, object_path) =
+            self.make_full_url(job_id, stage_id, partition_id, input_partition, "arrow");
 
         debug!("Writing shuffle data to object store: {}", full_url);
 
@@ -618,7 +623,6 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
         let num_bytes = buffer.len();
 
         // Upload to object store
-        let object_path = ObjectPath::from(relative_path);
         let payload = PutPayload::from(Bytes::from(buffer));
 
         self.store.put(&object_path, payload).await.map_err(|e| {
@@ -668,7 +672,7 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
     }
 
     async fn delete_job_data(&self, job_id: &str) -> Result<()> {
-        let prefix = ObjectPath::from(job_id.to_string());
+        let prefix = self.object_path(job_id);
 
         // List all objects with the job_id prefix
         let mut list_stream = self.store.list(Some(&prefix));
@@ -715,6 +719,16 @@ impl ShuffleStorage for ObjectStoreShuffleStorage {
 }
 
 impl ObjectStoreShuffleStorage {
+    fn object_path(&self, relative_path: &str) -> ObjectPath {
+        let relative_path = relative_path.trim_start_matches('/');
+        match &self.base_path {
+            Some(base_path) if !base_path.is_empty() => {
+                ObjectPath::from(format!("{base_path}/{relative_path}"))
+            }
+            _ => ObjectPath::from(relative_path),
+        }
+    }
+
     fn extract_object_path(&self, path: &str) -> Result<ObjectPath> {
         // Parse the URL and extract the path component
         if let Ok(url) = Url::parse(path) {
@@ -725,6 +739,13 @@ impl ObjectStoreShuffleStorage {
             Ok(ObjectPath::from(path))
         }
     }
+}
+
+fn object_store_base_path(base_url: &str) -> Option<String> {
+    Url::parse(base_url)
+        .ok()
+        .map(|url| url.path().trim_matches('/').to_string())
+        .filter(|path| !path.is_empty())
 }
 
 /// Factory for creating shuffle storage instances.

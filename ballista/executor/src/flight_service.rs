@@ -19,11 +19,16 @@
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::reader::StreamReader;
+use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
+use object_store::path::Path as ObjectPath;
 use std::convert::TryFrom;
 use std::fs::File;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio_util::io::ReaderStream;
+use url::Url;
 
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -45,7 +50,7 @@ use datafusion::arrow::ipc::writer::IpcWriteOptions;
 use datafusion::arrow::{error::ArrowError, record_batch::RecordBatch};
 use futures::{Stream, StreamExt, TryStreamExt};
 use log::{debug, info};
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufReader, Cursor, Read, Seek};
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::error::SendError;
 use tokio::{sync::mpsc::Sender, task};
@@ -176,6 +181,24 @@ impl FlightService for BallistaFlightService {
                         .with_schema(schema)
                         .with_options(write_options)
                         .build(stream)
+                        .map_err(|err| Status::from_error(Box::new(err)));
+
+                    return Ok(Response::new(
+                        Box::pin(flight_data_stream) as Self::DoGetStream
+                    ));
+                }
+
+                if is_object_store_path(path) {
+                    let (schema, rx) =
+                        read_object_store_arrow_ipc_partition(path).await?;
+
+                    let write_options: IpcWriteOptions = IpcWriteOptions::default()
+                        .try_with_compression(Some(CompressionType::LZ4_FRAME))
+                        .map_err(|e| from_arrow_err(&e))?;
+                    let flight_data_stream = FlightDataEncoderBuilder::new()
+                        .with_schema(schema)
+                        .with_options(write_options)
+                        .build(ReceiverStream::new(rx))
                         .map_err(|err| Status::from_error(Box::new(err)));
 
                     return Ok(Response::new(
@@ -372,9 +395,14 @@ impl FlightService for BallistaFlightService {
                             ));
                         }
 
+                        if is_object_store_path(path) {
+                            let stream = object_store_block_transfer_stream(path).await?;
+                            return Ok(Response::new(stream));
+                        }
+
                         // Handle disk-based partition
                         let file = tokio::fs::File::open(&path).await.map_err(|e| {
-                            Status::internal(format!("Failed to open file: {e}"))
+                            Status::internal(format!("Failed to open file {path}: {e}"))
                         })?;
 
                         debug!(
@@ -435,6 +463,100 @@ impl FlightService for BallistaFlightService {
     ) -> Result<Response<PollInfo>, Status> {
         Err(Status::unimplemented("poll_flight_info"))
     }
+}
+
+fn is_object_store_path(path: &str) -> bool {
+    path.starts_with("s3://")
+}
+
+fn open_object_store_path(
+    path: &str,
+) -> Result<(Arc<dyn ObjectStore>, ObjectPath), Status> {
+    let url = Url::parse(path).map_err(|e| {
+        Status::invalid_argument(format!("Failed to parse object store path {path}: {e}"))
+    })?;
+
+    let object_path = ObjectPath::from(url.path().trim_start_matches('/'));
+
+    match url.scheme() {
+        "s3" => {
+            let bucket = url.host_str().ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "Missing bucket in S3 shuffle path {path}"
+                ))
+            })?;
+            let store = AmazonS3Builder::from_env()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "Failed to build S3 object store for shuffle path {path}: {e}"
+                    ))
+                })?;
+            Ok((Arc::new(store), object_path))
+        }
+        scheme => Err(Status::unimplemented(format!(
+            "Unsupported object store shuffle path scheme {scheme} for {path}"
+        ))),
+    }
+}
+
+async fn object_store_block_transfer_stream(
+    path: &str,
+) -> Result<BoxedFlightStream<arrow_flight::Result>, Status> {
+    let (store, object_path) = open_object_store_path(path)?;
+    let get_result = store.get(&object_path).await.map_err(|e| {
+        Status::internal(format!(
+            "Failed to open object store shuffle path {path}: {e}"
+        ))
+    })?;
+
+    let path_for_error = path.to_string();
+    let stream = get_result.into_stream().map(move |result| {
+        result
+            .map(|body| arrow_flight::Result { body })
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to read object store shuffle path {path_for_error}: {e}"
+                ))
+            })
+    });
+
+    Ok(Box::pin(stream) as BoxedFlightStream<arrow_flight::Result>)
+}
+
+async fn read_object_store_arrow_ipc_partition(
+    path: &str,
+) -> Result<
+    (
+        SchemaRef,
+        tokio::sync::mpsc::Receiver<Result<RecordBatch, FlightError>>,
+    ),
+    Status,
+> {
+    let (store, object_path) = open_object_store_path(path)?;
+    let get_result = store.get(&object_path).await.map_err(|e| {
+        Status::internal(format!(
+            "Failed to open object store shuffle path {path}: {e}"
+        ))
+    })?;
+    let bytes = get_result.bytes().await.map_err(|e| {
+        Status::internal(format!(
+            "Failed to read object store shuffle path {path}: {e}"
+        ))
+    })?;
+    let reader = StreamReader::try_new(BufReader::new(Cursor::new(bytes.to_vec())), None)
+        .map_err(|e| from_arrow_err(&e))?;
+
+    let (tx, rx) = channel(2);
+    let schema = reader.schema();
+    task::spawn_blocking(move || {
+        if let Err(e) = read_arrow_ipc_batches(reader, tx) {
+            log::warn!("error streaming Arrow IPC object-store shuffle partition: {e}");
+        }
+    });
+
+    Ok((schema, rx))
 }
 
 /// Read an Arrow IPC partition file and return the schema and a receiver for record batches
