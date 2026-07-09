@@ -70,11 +70,12 @@ tokio-stream = { version = "0.1" }
 backoff = { version = "0.4" }
 url = { version = "2.5" }
 
-# Vortex columnar format dependencies from spiceai fork
-vortex-array = { git = "https://github.com/spiceai/vortex", branch = "spiceai-52", default-features = false }
-vortex-buffer = { git = "https://github.com/spiceai/vortex", branch = "spiceai-52", default-features = false }
-vortex-error = { git = "https://github.com/spiceai/vortex", branch = "spiceai-52", default-features = false }
-vortex-ipc = { git = "https://github.com/spiceai/vortex", branch = "spiceai-52", default-features = false }
+# Vortex columnar format dependencies from the spiceai fork. Pin the exact rev
+# so downstream release builds do not accidentally follow a moving branch head.
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6", default-features = false }
+vortex-buffer = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6", default-features = false }
+vortex-error = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6", default-features = false }
+vortex-ipc = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6", default-features = false }
 
 # cargo build --profile release-lto
 [profile.release-lto]
