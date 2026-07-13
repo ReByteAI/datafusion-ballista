@@ -32,9 +32,11 @@ use datafusion::prelude::SessionConfig;
 use rand::distr::Alphanumeric;
 
 use crate::cluster::JobState;
+use crate::scheduler_server::timestamp_millis;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
-    JobStatus, MultiTaskDefinition, TaskDefinition, TaskId, TaskStatus, job_status,
+    FailedJob, JobStatus, MultiTaskDefinition, TaskDefinition, TaskId, TaskStatus,
+    job_status,
 };
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use dashmap::DashMap;
@@ -51,6 +53,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, RwLock, watch};
 
 type ActiveJobCache = Arc<DashMap<String, JobInfoCache>>;
@@ -353,6 +356,36 @@ pub struct UpdatedStages {
 }
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U> {
+    fn notify_failed_subscriber(
+        subscriber: Option<&JobStatusSubscriber>,
+        job_id: &str,
+        job_name: &str,
+        queued_at: u64,
+        error: &str,
+    ) {
+        let Some(subscriber) = subscriber else {
+            return;
+        };
+
+        let timestamp = timestamp_millis();
+        let status = JobStatus {
+            job_id: job_id.to_owned(),
+            job_name: job_name.to_owned(),
+            status: Some(job_status::Status::Failed(FailedJob {
+                error: error.to_owned(),
+                queued_at,
+                started_at: 0,
+                ended_at: timestamp,
+            })),
+        };
+
+        if matches!(subscriber.try_send(status), Err(TrySendError::Full(_))) {
+            error!(
+                "jobs notification subscriber for job {job_id} is blocked, can't deliver status update, job notification will be missed"
+            );
+        }
+    }
+
     /// Creates a new `TaskManager` with the default task launcher.
     pub fn new(
         state: Arc<dyn JobState>,
@@ -540,11 +573,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             }
         };
         if let Some(reason) = aborted_before_planning {
-            if let Err(e) = self.state.fail_unscheduled_job(job_id, reason).await {
+            if let Err(e) = self
+                .state
+                .fail_unscheduled_job(job_id, reason.clone())
+                .await
+            {
                 debug!(
                     "Job {job_id} was already removed from the queued state after cancellation: {e}"
                 );
             }
+            Self::notify_failed_subscriber(
+                subscriber.as_ref(),
+                job_id,
+                job_name,
+                queued_at,
+                &reason,
+            );
             return Err(BallistaError::Cancelled);
         }
 
@@ -590,12 +634,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 JobLifecyclePhase::Aborted { reason } => {
                     let reason = reason.clone();
                     drop(phase);
-                    if let Err(e) = self.state.fail_unscheduled_job(job_id, reason).await
+                    if let Err(e) = self
+                        .state
+                        .fail_unscheduled_job(job_id, reason.clone())
+                        .await
                     {
                         debug!(
                             "Job {job_id} was already removed from the queued state after cancellation: {e}"
                         );
                     }
+                    Self::notify_failed_subscriber(
+                        subscriber.as_ref(),
+                        job_id,
+                        job_name,
+                        queued_at,
+                        &reason,
+                    );
                     return Err(BallistaError::Cancelled);
                 }
                 JobLifecyclePhase::Publishing | JobLifecyclePhase::Active => {
@@ -611,12 +665,21 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
         let submit_result = self
             .state
-            .submit_job(job_id.to_string(), &graph, subscriber)
+            .submit_job(job_id.to_string(), &graph, subscriber.clone())
             .await;
 
         if let Err(e) = submit_result {
             let mut phase = lifecycle.phase.lock().await;
-            if matches!(&*phase, JobLifecyclePhase::Aborted { .. }) {
+            if let JobLifecyclePhase::Aborted { reason } = &*phase {
+                let reason = reason.clone();
+                drop(phase);
+                Self::notify_failed_subscriber(
+                    subscriber.as_ref(),
+                    job_id,
+                    job_name,
+                    queued_at,
+                    &reason,
+                );
                 return Err(BallistaError::Cancelled);
             }
             if matches!(&*phase, JobLifecyclePhase::Publishing) {
@@ -895,9 +958,20 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 };
             }
         }
-        self.state
+        let result = self
+            .state
             .fail_unscheduled_job(job_id, failure_reason)
-            .await
+            .await;
+
+        if result.is_ok() {
+            // A planning failure is terminal and its publisher has already
+            // returned. Remove only the lifecycle instance that we failed so
+            // an unlikely job-ID reuse cannot lose its newer control.
+            self.job_lifecycles
+                .remove_if(job_id, |_, current| Arc::ptr_eq(current, &lifecycle));
+        }
+
+        result
     }
 
     /// Updates the job state and returns the number of new available tasks.
@@ -1315,6 +1389,14 @@ mod tests {
     }
 
     async fn submit_test_job(manager: &TestTaskManager, job_id: &str) -> Result<()> {
+        submit_test_job_with_subscriber(manager, job_id, None).await
+    }
+
+    async fn submit_test_job_with_subscriber(
+        manager: &TestTaskManager,
+        job_id: &str,
+        subscriber: Option<JobStatusSubscriber>,
+    ) -> Result<()> {
         manager
             .submit_job(
                 job_id,
@@ -1323,7 +1405,7 @@ mod tests {
                 test_plan(),
                 1,
                 Arc::new(SessionConfig::new_with_ballista()),
-                None,
+                subscriber,
             )
             .await
     }
@@ -1381,6 +1463,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_cancellation_notifies_job_status_subscriber() {
+        let manager = test_task_manager(memory_job_state().await);
+        let job_id = "cancelled-subscriber";
+        manager
+            .queue_job(job_id, "test-job", 1)
+            .expect("to queue test job");
+        manager
+            .cancel_job(job_id)
+            .await
+            .expect("to cancel queued job");
+
+        let (subscriber, mut statuses) = tokio::sync::mpsc::channel(1);
+        let submit_result =
+            submit_test_job_with_subscriber(&manager, job_id, Some(subscriber)).await;
+
+        assert!(matches!(submit_result, Err(BallistaError::Cancelled)));
+        let status = statuses
+            .try_recv()
+            .expect("cancelled subscriber to receive a terminal status");
+        assert!(
+            matches!(status.status, Some(Status::Failed(ref failed)) if failed.error == "Cancelled"),
+            "cancelled subscriber should receive Failed(Cancelled), got {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn planning_failure_releases_lifecycle_control() {
+        let manager = test_task_manager(memory_job_state().await);
+        let job_id = "planning-failure-cleanup";
+        manager
+            .queue_job(job_id, "test-job", 1)
+            .expect("to queue test job");
+        assert!(manager.job_lifecycles.contains_key(job_id));
+
+        manager
+            .fail_unscheduled_job(job_id, "planning failed".to_owned())
+            .await
+            .expect("to persist planning failure");
+
+        assert!(
+            !manager.job_lifecycles.contains_key(job_id),
+            "completed planning failure must not retain a lifecycle control"
+        );
+    }
+
+    #[tokio::test]
     async fn cancellation_while_persistent_submit_is_blocked_prevents_publication() {
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
@@ -1396,9 +1524,15 @@ mod tests {
             .queue_job(job_id, "test-job", 1)
             .expect("to queue test job");
 
+        let (subscriber, mut statuses) = tokio::sync::mpsc::channel(1);
         let submit_manager = manager.clone();
         let submit = tokio::spawn(async move {
-            submit_test_job(&submit_manager, "cancel-before-state-submit").await
+            submit_test_job_with_subscriber(
+                &submit_manager,
+                "cancel-before-state-submit",
+                Some(subscriber),
+            )
+            .await
         });
         entered.wait().await;
 
@@ -1410,6 +1544,13 @@ mod tests {
 
         let submit_result = submit.await.expect("submit task not to panic");
         assert!(matches!(submit_result, Err(BallistaError::Cancelled)));
+        let status = statuses
+            .try_recv()
+            .expect("cancelled publisher subscriber to receive a terminal status");
+        assert!(
+            matches!(status.status, Some(Status::Failed(ref failed)) if failed.error == "Cancelled"),
+            "cancelled publisher subscriber should receive Failed(Cancelled), got {status:?}"
+        );
         assert_failed_without_active_graph(&manager, job_id).await;
     }
 
