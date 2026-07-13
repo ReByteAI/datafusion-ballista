@@ -51,9 +51,43 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, watch};
 
 type ActiveJobCache = Arc<DashMap<String, JobInfoCache>>;
+type JobLifecycleControls = Arc<DashMap<String, Arc<JobLifecycleControl>>>;
+
+struct JobLifecycleControl {
+    phase: Mutex<JobLifecyclePhase>,
+    publication_finished: watch::Sender<bool>,
+}
+
+impl JobLifecycleControl {
+    fn new() -> Self {
+        let (publication_finished, _) = watch::channel(false);
+        Self {
+            phase: Mutex::new(JobLifecyclePhase::Queued),
+            publication_finished,
+        }
+    }
+}
+
+struct PublicationGuard {
+    lifecycle: Arc<JobLifecycleControl>,
+}
+
+impl Drop for PublicationGuard {
+    fn drop(&mut self) {
+        self.lifecycle.publication_finished.send_replace(true);
+    }
+}
+
+#[derive(Debug)]
+enum JobLifecyclePhase {
+    Queued,
+    Publishing,
+    Active,
+    Aborted { reason: String },
+}
 
 // TODO move to configuration file
 /// Default maximum number of failure attempts for task-level retry before the task is considered failed.
@@ -220,6 +254,9 @@ pub struct TaskManager<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
     scheduler_id: String,
     /// Cache for active jobs curated by this scheduler.
     active_job_cache: ActiveJobCache,
+    /// Per-job gate that makes cancellation linearizable with persistent-state
+    /// submission and active-cache publication.
+    job_lifecycles: JobLifecycleControls,
     /// Task launcher implementation.
     launcher: Arc<dyn TaskLauncher>,
 }
@@ -327,6 +364,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             codec,
             scheduler_id: scheduler_id.clone(),
             active_job_cache: Arc::new(DashMap::new()),
+            job_lifecycles: Arc::new(DashMap::new()),
             launcher: Arc::new(DefaultTaskLauncher::new(scheduler_id)),
         }
     }
@@ -343,13 +381,27 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             codec,
             scheduler_id,
             active_job_cache: Arc::new(DashMap::new()),
+            job_lifecycles: Arc::new(DashMap::new()),
             launcher,
         }
     }
 
+    fn job_lifecycle(&self, job_id: &str) -> Arc<JobLifecycleControl> {
+        Arc::clone(
+            self.job_lifecycles
+                .entry(job_id.to_owned())
+                .or_insert_with(|| Arc::new(JobLifecycleControl::new()))
+                .value(),
+        )
+    }
+
     /// Enqueue a job for scheduling
     pub fn queue_job(&self, job_id: &str, job_name: &str, queued_at: u64) -> Result<()> {
-        self.state.accept_job(job_id, job_name, queued_at)
+        self.state.accept_job(job_id, job_name, queued_at)?;
+        // Do not replace an existing control: an early cancellation for this
+        // ID is a tombstone that a late JobQueued event must respect.
+        self.job_lifecycle(job_id);
+        Ok(())
     }
 
     /// Get the number of queued jobs. If it's big, then it means the scheduler is too busy.
@@ -478,6 +530,24 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         session_config: Arc<SessionConfig>,
         subscriber: Option<JobStatusSubscriber>,
     ) -> Result<()> {
+        let lifecycle = self.job_lifecycle(job_id);
+        let aborted_before_planning = {
+            let phase = lifecycle.phase.lock().await;
+            if let JobLifecyclePhase::Aborted { reason } = &*phase {
+                Some(reason.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(reason) = aborted_before_planning {
+            if let Err(e) = self.state.fail_unscheduled_job(job_id, reason).await {
+                debug!(
+                    "Job {job_id} was already removed from the queued state after cancellation: {e}"
+                );
+            }
+            return Err(BallistaError::Cancelled);
+        }
+
         let mut planner = DefaultDistributedPlanner::new();
 
         let mut graph = if session_config.ballista_adaptive_query_planner_enabled() {
@@ -510,12 +580,73 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
         info!("Submitting execution graph:\n\n{graph:?}");
 
-        self.state
+        {
+            let mut phase = lifecycle.phase.lock().await;
+            match &*phase {
+                JobLifecyclePhase::Queued => {
+                    lifecycle.publication_finished.send_replace(false);
+                    *phase = JobLifecyclePhase::Publishing;
+                }
+                JobLifecyclePhase::Aborted { reason } => {
+                    let reason = reason.clone();
+                    drop(phase);
+                    if let Err(e) = self.state.fail_unscheduled_job(job_id, reason).await
+                    {
+                        debug!(
+                            "Job {job_id} was already removed from the queued state after cancellation: {e}"
+                        );
+                    }
+                    return Err(BallistaError::Cancelled);
+                }
+                JobLifecyclePhase::Publishing | JobLifecyclePhase::Active => {
+                    return Err(BallistaError::Internal(format!(
+                        "Job {job_id} is already being submitted"
+                    )));
+                }
+            }
+        }
+        let _publication_guard = PublicationGuard {
+            lifecycle: Arc::clone(&lifecycle),
+        };
+
+        let submit_result = self
+            .state
             .submit_job(job_id.to_string(), &graph, subscriber)
-            .await?;
+            .await;
+
+        if let Err(e) = submit_result {
+            let mut phase = lifecycle.phase.lock().await;
+            if matches!(&*phase, JobLifecyclePhase::Aborted { .. }) {
+                return Err(BallistaError::Cancelled);
+            }
+            if matches!(&*phase, JobLifecyclePhase::Publishing) {
+                *phase = JobLifecyclePhase::Queued;
+            }
+            return Err(e);
+        }
+
+        let mut phase = lifecycle.phase.lock().await;
+        if let JobLifecyclePhase::Aborted { reason } = &*phase {
+            let reason = reason.clone();
+            drop(phase);
+            graph.fail_job(reason);
+            self.state.save_job(job_id, &graph).await?;
+            return Err(BallistaError::Cancelled);
+        }
+        if !matches!(&*phase, JobLifecyclePhase::Publishing) {
+            return Err(BallistaError::Internal(format!(
+                "Job {job_id} reached an invalid lifecycle phase before publication"
+            )));
+        }
+
+        // The phase lock is the publication linearization point. Cancellation
+        // either records its tombstone before this block (so publication is
+        // refused above) or acquires the same lock afterwards and removes the
+        // graph before returning.
         graph.revive();
         self.active_job_cache
             .insert(job_id.to_owned(), JobInfoCache::new(graph));
+        *phase = JobLifecyclePhase::Active;
 
         Ok(())
     }
@@ -671,9 +802,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         job_id: &str,
         failure_reason: String,
     ) -> Result<(Vec<RunningTaskInfo>, usize)> {
-        let (tasks_to_cancel, pending_tasks) = if let Some(graph) =
-            self.remove_active_execution_graph(job_id)
-        {
+        let lifecycle = self.job_lifecycle(job_id);
+        let mut publication_finished = lifecycle.publication_finished.subscribe();
+        let (graph, was_publishing) = {
+            let mut phase = lifecycle.phase.lock().await;
+            let was_publishing = matches!(&*phase, JobLifecyclePhase::Publishing);
+            if !matches!(&*phase, JobLifecyclePhase::Aborted { .. }) {
+                *phase = JobLifecyclePhase::Aborted {
+                    reason: failure_reason.clone(),
+                };
+            }
+            // Removing the graph under the same gate used for publication
+            // prevents a late submit from inserting it after cancellation.
+            (self.remove_active_execution_graph(job_id), was_publishing)
+        };
+
+        let (tasks_to_cancel, pending_tasks) = if let Some(graph) = graph {
             let mut guard = graph.write().await;
 
             let pending_tasks = guard.available_tasks();
@@ -691,10 +835,44 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
             (running_tasks, pending_tasks)
         } else {
-            // TODO listen the job state update event and fix task cancelling
-            warn!(
-                "Fail to find job {job_id} in the cache, unable to cancel tasks for job, fail the job state only."
-            );
+            // Cancellation may arrive while the job is queued or while
+            // `state.submit_job` is in flight. Removing a queued job makes a
+            // late submit fail; if persistence already moved it to Running,
+            // the publisher observes the tombstone and saves its graph failed
+            // instead of exposing it through the active cache.
+            let fail_unscheduled_result = self
+                .state
+                .fail_unscheduled_job(job_id, failure_reason)
+                .await;
+            if let Err(e) = &fail_unscheduled_result {
+                debug!(
+                    "Job {job_id} was not in queued state while cancellation raced with publication: {e}"
+                );
+            }
+
+            if was_publishing && fail_unscheduled_result.is_err() {
+                // Persistent submission already won the queued-state race.
+                // Wait for the publisher to observe the tombstone, persist its
+                // graph as failed, and decline active-cache publication before
+                // acknowledging cancellation.
+                while !*publication_finished.borrow_and_update() {
+                    publication_finished.changed().await.map_err(|_| {
+                        BallistaError::Internal(format!(
+                            "Job {job_id} publication ended without reporting completion"
+                        ))
+                    })?;
+                }
+
+                let status = self.state.get_job_status(job_id).await?;
+                if !matches!(
+                    status.as_ref().and_then(|status| status.status.as_ref()),
+                    Some(job_status::Status::Failed(_))
+                ) {
+                    return Err(BallistaError::Internal(format!(
+                        "Job {job_id} cancellation did not reach a durable failed state"
+                    )));
+                }
+            }
             (vec![], 0)
         };
 
@@ -708,6 +886,15 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         job_id: &str,
         failure_reason: String,
     ) -> Result<()> {
+        let lifecycle = self.job_lifecycle(job_id);
+        {
+            let mut phase = lifecycle.phase.lock().await;
+            if !matches!(&*phase, JobLifecyclePhase::Aborted { .. }) {
+                *phase = JobLifecyclePhase::Aborted {
+                    reason: failure_reason.clone(),
+                };
+            }
+        }
         self.state
             .fail_unscheduled_job(job_id, failure_reason)
             .await
@@ -950,10 +1137,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         }
 
         let state = self.state.clone();
+        let job_lifecycles = Arc::clone(&self.job_lifecycles);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(clean_up_interval)).await;
             if let Err(err) = state.remove_job(&job_id).await {
                 error!("Failed to delete job {job_id}: {err:?}");
+            } else {
+                job_lifecycles.remove(&job_id);
             }
         });
     }
@@ -990,5 +1180,298 @@ impl From<&ExecutionGraphBox> for JobOverview {
             num_stages: value.stage_count(),
             completed_stages,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::{BallistaCluster, JobStateEventStream};
+    use crate::config::SchedulerConfig;
+    use ballista_core::serde::BallistaCodec;
+    use ballista_core::serde::protobuf::job_status::Status;
+    use datafusion::arrow::datatypes::Schema;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
+    use tokio::sync::Barrier;
+
+    #[derive(Clone, Copy)]
+    enum SubmitBarrierPoint {
+        BeforePersistentSubmit,
+        AfterPersistentSubmit,
+    }
+
+    struct BarrierJobState {
+        inner: Arc<dyn JobState>,
+        point: SubmitBarrierPoint,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    #[async_trait::async_trait]
+    impl JobState for BarrierJobState {
+        fn accept_job(&self, job_id: &str, job_name: &str, queued_at: u64) -> Result<()> {
+            self.inner.accept_job(job_id, job_name, queued_at)
+        }
+
+        fn pending_job_number(&self) -> usize {
+            self.inner.pending_job_number()
+        }
+
+        async fn submit_job(
+            &self,
+            job_id: String,
+            graph: &ExecutionGraphBox,
+            subscriber: Option<JobStatusSubscriber>,
+        ) -> Result<()> {
+            if matches!(self.point, SubmitBarrierPoint::BeforePersistentSubmit) {
+                self.entered.wait().await;
+                self.release.wait().await;
+            }
+
+            let result = self.inner.submit_job(job_id, graph, subscriber).await;
+
+            if matches!(self.point, SubmitBarrierPoint::AfterPersistentSubmit) {
+                self.entered.wait().await;
+                self.release.wait().await;
+            }
+
+            result
+        }
+
+        async fn get_jobs(&self) -> Result<HashSet<String>> {
+            self.inner.get_jobs().await
+        }
+
+        async fn get_job_status(&self, job_id: &str) -> Result<Option<JobStatus>> {
+            self.inner.get_job_status(job_id).await
+        }
+
+        async fn get_execution_graph(
+            &self,
+            job_id: &str,
+        ) -> Result<Option<ExecutionGraphBox>> {
+            self.inner.get_execution_graph(job_id).await
+        }
+
+        async fn save_job(&self, job_id: &str, graph: &ExecutionGraphBox) -> Result<()> {
+            self.inner.save_job(job_id, graph).await
+        }
+
+        async fn fail_unscheduled_job(&self, job_id: &str, reason: String) -> Result<()> {
+            self.inner.fail_unscheduled_job(job_id, reason).await
+        }
+
+        async fn remove_job(&self, job_id: &str) -> Result<()> {
+            self.inner.remove_job(job_id).await
+        }
+
+        async fn try_acquire_job(
+            &self,
+            job_id: &str,
+        ) -> Result<Option<ExecutionGraphBox>> {
+            self.inner.try_acquire_job(job_id).await
+        }
+
+        async fn job_state_events(&self) -> Result<JobStateEventStream> {
+            self.inner.job_state_events().await
+        }
+
+        async fn create_or_update_session(
+            &self,
+            session_id: &str,
+            config: &SessionConfig,
+        ) -> Result<Arc<SessionContext>> {
+            self.inner
+                .create_or_update_session(session_id, config)
+                .await
+        }
+
+        async fn remove_session(&self, session_id: &str) -> Result<()> {
+            self.inner.remove_session(session_id).await
+        }
+
+        fn produce_config(&self) -> SessionConfig {
+            self.inner.produce_config()
+        }
+    }
+
+    type TestTaskManager = TaskManager<LogicalPlanNode, PhysicalPlanNode>;
+
+    async fn memory_job_state() -> Arc<dyn JobState> {
+        BallistaCluster::new_from_config(&SchedulerConfig::default())
+            .await
+            .expect("to create in-memory scheduler state")
+            .job_state()
+    }
+
+    fn test_task_manager(state: Arc<dyn JobState>) -> TestTaskManager {
+        TaskManager::new(state, BallistaCodec::default(), "test-scheduler".to_owned())
+    }
+
+    fn test_plan() -> Arc<dyn ExecutionPlan> {
+        Arc::new(EmptyExec::new(Arc::new(Schema::empty())).with_partitions(1))
+    }
+
+    async fn submit_test_job(manager: &TestTaskManager, job_id: &str) -> Result<()> {
+        manager
+            .submit_job(
+                job_id,
+                "test-job",
+                "test-session",
+                test_plan(),
+                1,
+                Arc::new(SessionConfig::new_with_ballista()),
+                None,
+            )
+            .await
+    }
+
+    async fn assert_failed_without_active_graph(manager: &TestTaskManager, job_id: &str) {
+        assert!(
+            manager.get_active_execution_graph(job_id).is_none(),
+            "cancelled job must not remain in the active cache"
+        );
+        assert_eq!(
+            manager.running_job_number(),
+            0,
+            "cancelled job must not expose runnable tasks"
+        );
+
+        let status = manager
+            .get_job_status(job_id)
+            .await
+            .expect("to read cancelled job status")
+            .expect("cancelled job status to exist");
+        assert!(
+            matches!(status.status, Some(Status::Failed(ref failed)) if failed.error == "Cancelled"),
+            "cancelled job should be durably failed, got {status:?}"
+        );
+    }
+
+    async fn wait_for_abort_tombstone(manager: &TestTaskManager, job_id: &str) {
+        loop {
+            let lifecycle = manager.job_lifecycle(job_id);
+            let phase = lifecycle.phase.lock().await;
+            if matches!(&*phase, JobLifecyclePhase::Aborted { .. }) {
+                return;
+            }
+            drop(phase);
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_submit_is_a_tombstone() {
+        let manager = test_task_manager(memory_job_state().await);
+        let job_id = "cancel-before-submit";
+        manager
+            .queue_job(job_id, "test-job", 1)
+            .expect("to queue test job");
+
+        manager
+            .cancel_job(job_id)
+            .await
+            .expect("to cancel queued job");
+        let submit_result = submit_test_job(&manager, job_id).await;
+
+        assert!(matches!(submit_result, Err(BallistaError::Cancelled)));
+        assert_failed_without_active_graph(&manager, job_id).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_persistent_submit_is_blocked_prevents_publication() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let state: Arc<dyn JobState> = Arc::new(BarrierJobState {
+            inner: memory_job_state().await,
+            point: SubmitBarrierPoint::BeforePersistentSubmit,
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let manager = test_task_manager(state);
+        let job_id = "cancel-before-state-submit";
+        manager
+            .queue_job(job_id, "test-job", 1)
+            .expect("to queue test job");
+
+        let submit_manager = manager.clone();
+        let submit = tokio::spawn(async move {
+            submit_test_job(&submit_manager, "cancel-before-state-submit").await
+        });
+        entered.wait().await;
+
+        manager
+            .cancel_job(job_id)
+            .await
+            .expect("to cancel job blocked before persistent submit");
+        release.wait().await;
+
+        let submit_result = submit.await.expect("submit task not to panic");
+        assert!(matches!(submit_result, Err(BallistaError::Cancelled)));
+        assert_failed_without_active_graph(&manager, job_id).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_persistent_submit_prevents_cache_publication() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let state: Arc<dyn JobState> = Arc::new(BarrierJobState {
+            inner: memory_job_state().await,
+            point: SubmitBarrierPoint::AfterPersistentSubmit,
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let manager = test_task_manager(state);
+        let job_id = "cancel-after-state-submit";
+        manager
+            .queue_job(job_id, "test-job", 1)
+            .expect("to queue test job");
+
+        let submit_manager = manager.clone();
+        let submit = tokio::spawn(async move {
+            submit_test_job(&submit_manager, "cancel-after-state-submit").await
+        });
+        entered.wait().await;
+
+        let cancel_manager = manager.clone();
+        let cancel = tokio::spawn(async move {
+            cancel_manager.cancel_job("cancel-after-state-submit").await
+        });
+        wait_for_abort_tombstone(&manager, job_id).await;
+        assert!(
+            !cancel.is_finished(),
+            "cancellation must wait until the publisher durably fails the job"
+        );
+        release.wait().await;
+
+        cancel
+            .await
+            .expect("cancel task not to panic")
+            .expect("to cancel job after persistent submit");
+        let submit_result = submit.await.expect("submit task not to panic");
+        assert!(matches!(submit_result, Err(BallistaError::Cancelled)));
+        assert_failed_without_active_graph(&manager, job_id).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_cache_publication_removes_graph() {
+        let manager = test_task_manager(memory_job_state().await);
+        let job_id = "cancel-after-cache-publish";
+        manager
+            .queue_job(job_id, "test-job", 1)
+            .expect("to queue test job");
+        submit_test_job(&manager, job_id)
+            .await
+            .expect("to publish active graph");
+        assert!(manager.get_active_execution_graph(job_id).is_some());
+
+        manager
+            .cancel_job(job_id)
+            .await
+            .expect("to cancel active job");
+
+        assert_failed_without_active_graph(&manager, job_id).await;
     }
 }

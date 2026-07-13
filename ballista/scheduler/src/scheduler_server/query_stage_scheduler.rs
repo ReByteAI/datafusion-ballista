@@ -146,7 +146,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 // Clone the job state sender to move into the async task
                 let job_state_sender = self.job_state_sender.clone();
                 tokio::spawn(async move {
-                    let event = if let Err(e) = state
+                    let event = match state
                         .submit_job(
                             &job_id,
                             &job_name,
@@ -157,14 +157,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                         )
                         .await
                     {
-                        let error = e.to_string();
-                        let fail_message = format!("Error planning job {job_id}: {e:?}");
+                        Err(BallistaError::Cancelled) => {
+                            // JobCancel owns the terminal notification and
+                            // cleanup. A cancelled publisher must not emit a
+                            // second, misleading planning-failure event.
+                            return;
+                        }
+                        Err(e) => {
+                            let error = e.to_string();
+                            let fail_message =
+                                format!("Error planning job {job_id}: {e:?}");
 
-                        // this is a corner case, as most of job status changes are handled in
-                        // job state, after job is submitted to job state
-                        if let Some(subscriber) = subscriber {
-                            let timestamp = timestamp_millis();
-                            let job_status = JobStatus {
+                            // this is a corner case, as most of job status changes are handled in
+                            // job state, after job is submitted to job state
+                            if let Some(subscriber) = subscriber {
+                                let timestamp = timestamp_millis();
+                                let job_status = JobStatus {
                                 job_id: job_id.clone(),
                                 job_name,
                                 status: Some(ballista_core::serde::protobuf::job_status::Status::Failed(
@@ -172,31 +180,34 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                                 ))
                             };
 
-                            if matches!(
-                                subscriber.try_send(job_status),
-                                Err(TrySendError::Full(_))
-                            ) {
-                                error!(
-                                    "jobs notification subscriber for job {} is blocked, can't deliver status update, job notification will be missed",
-                                    job_id
-                                )
+                                if matches!(
+                                    subscriber.try_send(job_status),
+                                    Err(TrySendError::Full(_))
+                                ) {
+                                    error!(
+                                        "jobs notification subscriber for job {} is blocked, can't deliver status update, job notification will be missed",
+                                        job_id
+                                    )
+                                }
+                            }
+
+                            error!("{}", &fail_message);
+                            QueryStageSchedulerEvent::JobPlanningFailed {
+                                job_id,
+                                fail_message,
+                                queued_at,
+                                failed_at: timestamp_millis(),
                             }
                         }
-
-                        error!("{}", &fail_message);
-                        QueryStageSchedulerEvent::JobPlanningFailed {
-                            job_id,
-                            fail_message,
-                            queued_at,
-                            failed_at: timestamp_millis(),
-                        }
-                    } else {
-                        // Broadcast job running state when successfully submitted
-                        let _ = job_state_sender.send(JobStateEvent::running(&job_id));
-                        QueryStageSchedulerEvent::JobSubmitted {
-                            job_id,
-                            queued_at,
-                            submitted_at: timestamp_millis(),
+                        Ok(()) => {
+                            // Broadcast job running state when successfully submitted
+                            let _ =
+                                job_state_sender.send(JobStateEvent::running(&job_id));
+                            QueryStageSchedulerEvent::JobSubmitted {
+                                job_id,
+                                queued_at,
+                                submitted_at: timestamp_millis(),
+                            }
                         }
                     };
                     if let Err(e) = event_sender.post_event(event).await {
